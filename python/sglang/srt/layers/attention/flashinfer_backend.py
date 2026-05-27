@@ -477,9 +477,16 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         else:
             prefix_lens = forward_batch.extend_prefix_lens
+            multi_item_params = MultiItemScoringParams()
 
-            # Disable ragged wrapper and ensure prefix handling for multimodal and multi-item scoring
-            if self.is_multimodal or self.enable_mis:
+            if forward_batch.forward_mode.is_dllm_extend():
+                prefix_lens = self._get_dllm_prefix_lens(
+                    forward_batch.seq_lens,
+                    num_tokens=forward_batch.input_ids.numel(),
+                )
+                use_ragged = False
+                extend_no_prefix = False
+            elif self.is_multimodal or self.enable_mis:
                 # use_ragged = False: Multi-item scoring requires the paged wrapper because:
                 # 1. Ragged wrapper doesn't support the specialized multi-item parameters
                 #    (prefix_len_ptr, token_pos_in_items_ptr, etc.)
@@ -488,6 +495,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 # 3. Custom masking logic conflicts with ragged wrapper's assumptions
                 use_ragged = False
                 extend_no_prefix = False
+                if self.enable_mis:
+                    multi_item_params = self._process_multi_item_scoring(forward_batch)
             else:
                 use_ragged = (
                     not self.enable_deterministic
@@ -495,12 +504,6 @@ class FlashInferAttnBackend(AttentionBackend):
                     and not self.use_paged
                 )
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
-
-            # Process multi-item scoring in attention backend instead of ForwardBatch
-            multi_item_params = MultiItemScoringParams()
-            if self.enable_mis:
-                # Use new backend-specific implementation
-                multi_item_params = self._process_multi_item_scoring(forward_batch)
 
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
@@ -522,6 +525,25 @@ class FlashInferAttnBackend(AttentionBackend):
                 extend_no_prefix,
                 multi_item_params,
             )
+
+    def _get_dllm_prefix_lens(
+        self,
+        seq_lens: torch.Tensor,
+        *,
+        num_tokens: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Return dLLM prefix lengths after validating block query shape."""
+        assert self.dllm_config is not None, "dLLM config is required"
+        block_size = self.dllm_config.block_size
+        bs = len(seq_lens)
+
+        if num_tokens is not None:
+            assert num_tokens == bs * block_size, (
+                f"Expected one dLLM block per request, got {num_tokens=} "
+                f"for {bs=} and {block_size=}"
+            )
+
+        return seq_lens - block_size
 
     def init_cuda_graph_state(
         self,
@@ -694,19 +716,23 @@ class FlashInferAttnBackend(AttentionBackend):
                     )
                 )
             seq_lens_sum = seq_lens.sum().item()
+            prefix_lens = self._get_dllm_prefix_lens(
+                seq_lens,
+                num_tokens=num_tokens,
+            )
             self.indices_updater_prefill.update(
                 req_pool_indices,
                 seq_lens,
                 seq_lens.cpu(),  # may add a little overhead in capture stage
                 seq_lens_sum,
-                prefix_lens=seq_lens - self.dllm_config.block_size,
+                prefix_lens=prefix_lens,
                 prefill_wrappers=prefill_wrappers,
-                use_ragged=not self.use_paged,
+                use_ragged=False,
                 encoder_lens=encoder_lens,
                 spec_info=None,
             )
             self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
-            self.forward_metadata = PrefillMetadata(prefill_wrappers, True, False)
+            self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
 
@@ -758,14 +784,18 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=spec_info,
             )
         elif forward_mode.is_dllm_extend():
+            prefix_lens = self._get_dllm_prefix_lens(
+                seq_lens[:bs],
+                num_tokens=bs * self.dllm_config.block_size,
+            )
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
-                prefix_lens=seq_lens - self.dllm_config.block_size,
+                prefix_lens=prefix_lens,
                 prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
-                use_ragged=not self.use_paged,
+                use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=None,
             )
@@ -773,6 +803,8 @@ class FlashInferAttnBackend(AttentionBackend):
             raise ValueError("Invalid forward mode")
 
     def get_cuda_graph_seq_len_fill_value(self):
+        if self.is_dllm_model:
+            return self.dllm_config.block_size
         return 1
 
     @debug_kernel_api

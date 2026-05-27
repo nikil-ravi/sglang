@@ -603,32 +603,22 @@ class PrefillAdder:
         self.log_input_tokens += extend_input_len
 
     def _get_dllm_remain_tokens(self) -> int:
-        _rem_tokens = min(
+        """Return the currently schedulable dLLM token budget."""
+        return min(
             self.rem_dllm_tokens,
-            self.dllm_block_size,
             int(self.rem_total_tokens),
+            int(self.cur_rem_tokens),
+            self.rem_input_tokens,
         )
-        if _rem_tokens <= 0:
-            _rem_tokens = self.rem_dllm_tokens
-
-        return _rem_tokens
 
     def _add_dllm_req(self, req: Req, prefix_len: int):
-        # FIXME: consider the case when rem_dllm_tokens < dllm_block_size,
-        # the diffusion unmask process may have some problems
-        # Make sure at least one page is available
-        trunc_len = (
-            min(self.rem_dllm_tokens, self.dllm_block_size)
-            // self.page_size
-            * self.page_size
-        )
-
-        req.extend_input_len = trunc_len
-        req.fill_ids = req.fill_ids[: prefix_len + trunc_len]
+        """Add one full dLLM block."""
+        assert self._get_dllm_remain_tokens() >= self.dllm_block_size
+        req.extend_input_len = self.dllm_block_size
+        req.fill_ids = req.fill_ids[: prefix_len + self.dllm_block_size]
 
         self.can_run_list.append(req)
-
-        self._update_prefill_budget(prefix_len, trunc_len, 0)
+        self._update_prefill_budget(prefix_len, self.dllm_block_size, 0)
 
     def _req_inc_lock_ref(self, req: Req):
         result = self.tree_cache.inc_lock_ref(req.last_node)
@@ -639,27 +629,15 @@ class PrefillAdder:
         assert self.dllm_config is not None
         _rem_tokens = self._get_dllm_remain_tokens()
 
-        if _rem_tokens <= 0:
+        if _rem_tokens < self.dllm_block_size:
             return AddReqResult.NO_TOKEN
 
-        # Truncate input length to available tokens and update request metadata
-        truncated = req.extend_input_len > _rem_tokens
-        req.extend_input_len = min(req.extend_input_len, _rem_tokens)
-        req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
-        self.can_run_list.append(req)
-
-        # Update budget: reserve max_new_tokens only if not truncated
-        max_new_tokens = (
-            min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
-            if not truncated
-            else 0
-        )
-        self._update_prefill_budget(0, req.extend_input_len, max_new_tokens)
+        self._add_dllm_req(req, len(req.prefix_indices))
 
         # Return based on remaining token availability
         return (
             AddReqResult.NO_TOKEN
-            if self._get_dllm_remain_tokens() <= 0
+            if self._get_dllm_remain_tokens() < self.dllm_block_size
             else AddReqResult.CONTINUE
         )
 
@@ -716,11 +694,16 @@ class PrefillAdder:
                 self.tree_cache.dec_lock_ref(last_node)
 
     def add_one_req_ignore_eos(self, req: Req):
-        paged_input = self.ceil_paged_tokens(req.extend_input_len)
+        planned_extend_input_len = (
+            self.dllm_block_size
+            if self.dllm_config is not None
+            else req.extend_input_len
+        )
+        paged_input = self.ceil_paged_tokens(planned_extend_input_len)
         if paged_input > min(self.cur_rem_tokens, self.rem_total_tokens):
             return AddReqResult.NO_TOKEN
         if self.is_hybrid_swa:
-            if self._swa_budget_for_req(req.extend_input_len) > self.rem_swa_tokens:
+            if self._swa_budget_for_req(planned_extend_input_len) > self.rem_swa_tokens:
                 return AddReqResult.NO_TOKEN
 
         def add_req_state(r, insert_sort=False):
@@ -759,9 +742,7 @@ class PrefillAdder:
         if not self.is_hybrid_swa:
             # Skip this logic for swa. The SWA has different memory management, and
             # this mechanism is underestimating the memory usage.
-            cur_rem_tokens = self.cur_rem_tokens - self.ceil_paged_tokens(
-                req.extend_input_len
-            )
+            cur_rem_tokens = self.cur_rem_tokens - paged_input
             tokens_freed = 0
             for i, (tokens_left, tokens_occupied) in enumerate(self.req_states):
                 # tokens_left gives a reservative calculation as the last token is not stored
@@ -780,7 +761,7 @@ class PrefillAdder:
             return AddReqResult.OTHER
 
         if self.dllm_config is not None:
-            if self.rem_dllm_tokens <= 0:
+            if self._get_dllm_remain_tokens() < self.dllm_block_size:
                 return AddReqResult.OTHER
 
             self._add_dllm_req(req, 0)
@@ -842,14 +823,23 @@ class PrefillAdder:
         # _update_prefill_budget already accounts for this in the deduction.
         # Without this, admission is more optimistic than the actual budget
         # deduction, allowing over-admission when the pool is nearly full.
-        max_new = min(
-            max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
-            CLIP_MAX_NEW_TOKENS,
+        planned_extend_input_len = (
+            self.dllm_block_size
+            if self.dllm_config is not None
+            else req.extend_input_len
         )
-        total_tokens = req.extend_input_len + max_new + self.page_size
+        max_new = (
+            0
+            if self.dllm_config is not None
+            else min(
+                max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
+                CLIP_MAX_NEW_TOKENS,
+            )
+        )
+        total_tokens = planned_extend_input_len + max_new + self.page_size
 
         # adjusting the input_tokens based on host_hit_length and page_size
-        real_input_tokens = req.extend_input_len - req.host_hit_length
+        real_input_tokens = max(planned_extend_input_len - req.host_hit_length, 0)
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         prefix_len = len(req.prefix_indices)
 
@@ -857,7 +847,7 @@ class PrefillAdder:
             return AddReqResult.NO_TOKEN
 
         if self.is_hybrid_swa:
-            swa_needed = self._swa_budget_for_req(req.extend_input_len)
+            swa_needed = self._swa_budget_for_req(planned_extend_input_len)
             if swa_needed >= self.rem_swa_tokens:
                 return AddReqResult.NO_TOKEN
 
@@ -877,7 +867,7 @@ class PrefillAdder:
                 return AddReqResult.NO_TOKEN
 
             if self.is_hybrid_swa:
-                swa_needed = self._swa_budget_for_req(req.extend_input_len)
+                swa_needed = self._swa_budget_for_req(planned_extend_input_len)
                 if swa_needed >= self.rem_swa_tokens:
                     return AddReqResult.NO_TOKEN
 
@@ -894,7 +884,7 @@ class PrefillAdder:
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
 
-            input_tokens = self.ceil_paged_tokens(req.extend_input_len)
+            input_tokens = self.ceil_paged_tokens(planned_extend_input_len)
 
             if (
                 self.rem_chunk_tokens is None
@@ -907,7 +897,7 @@ class PrefillAdder:
                 return AddReqResult.OTHER
 
             if self.dllm_config is not None:
-                if self.rem_dllm_tokens <= 0:
+                if self._get_dllm_remain_tokens() < self.dllm_block_size:
                     return AddReqResult.OTHER
 
                 assert (

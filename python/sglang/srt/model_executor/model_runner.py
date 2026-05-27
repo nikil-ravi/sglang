@@ -2441,6 +2441,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             capture_forward_mode = ForwardMode.EXTEND
         capture_hidden_mode = CaptureHiddenMode.NULL
         num_tokens_per_bs = 1
+        dllm_config = None
         if self.spec_algorithm.is_speculative():
             if self.is_draft_worker:
                 if not self.spec_algorithm.supports_target_verify_for_draft():
@@ -2451,6 +2452,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     self.server_args.speculative_num_draft_tokens, self.is_draft_worker
                 )
             )
+        elif self.server_args.dllm_algorithm is not None:
+            from sglang.srt.dllm.config import DllmConfig
+
+            dllm_config = DllmConfig.from_server_args(self.server_args)
+            capture_forward_mode = ForwardMode.DLLM_EXTEND
+            num_tokens_per_bs = dllm_config.block_size
 
         if self.server_args.enable_return_hidden_states:
             capture_hidden_mode = CaptureHiddenMode.FULL
@@ -2510,7 +2517,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         buffers.num_token_non_padded[...] = num_tokens
 
         # For extend mode
-        if not self.is_generation:
+        if not self.is_generation or dllm_config is not None:
             extend_prefix_lens_cpu = [0] * batch_size
             extend_seq_lens_cpu = [seq_len_fill_value] * batch_size
             extend_num_tokens = num_tokens

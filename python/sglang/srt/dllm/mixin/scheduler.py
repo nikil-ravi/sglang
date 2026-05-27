@@ -69,17 +69,21 @@ class SchedulerDllmMixin:
         if result.copy_done is not None:
             result.copy_done.synchronize()
 
-        if result.next_token_ids:
+        has_new_tokens = False
+        next_token_ids_list = result.next_token_ids or []
+
+        if next_token_ids_list:
             self.token_to_kv_pool_allocator.free_group_begin()
+            for idx, req in enumerate(batch.reqs):
+                if idx >= len(next_token_ids_list):
+                    break
 
-            for idx in range(batch.batch_size()):
-                req = batch.reqs[idx]
-
-                next_token_ids = result.next_token_ids[idx].tolist()
+                next_token_ids = next_token_ids_list[idx].tolist()
                 new_tokens = len(next_token_ids)
                 if new_tokens == 0:
                     continue
 
+                has_new_tokens = True
                 req.fill_ids[-new_tokens:] = array("q", next_token_ids)
                 self.metrics_reporter.num_generated_tokens += new_tokens
 
@@ -89,9 +93,15 @@ class SchedulerDllmMixin:
                 if req.finished():
                     release_kv_cache(req, self.tree_cache)
                     req.time_stats.set_completion_time()
-
-            self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
             self.token_to_kv_pool_allocator.free_group_end()
+
+        for req in batch.reqs:
+            if req.inflight_middle_chunks > 0:
+                req.inflight_middle_chunks -= 1
+                req.time_stats.set_last_chunked_prefill_finish_time()
+
+        if has_new_tokens:
+            self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
 
         can_run_cuda_graph = result.can_run_cuda_graph
         self.metrics_reporter.report_prefill_stats(
